@@ -1,0 +1,145 @@
+name: Build Android Auto APK
+
+# Builds the VLC for Android app (which already ships Android Auto support
+# via its manifest metadata and automotive_app_desc.xml resource) using the
+# same Docker images and build steps as the project's GitLab CI.
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      vlc_version:
+        description: "VLC major version to build against"
+        type: choice
+        options:
+          - "3"
+          - "4"
+        default: "3"
+      build_variant:
+        description: "Build variant"
+        type: choice
+        options:
+          - Debug
+          - Release
+        default: Debug
+
+permissions:
+  contents: read
+
+env:
+  # GitLab CI docker images, see buildsystem/gitlab/.gitlab-ci.yml
+  VLC_ANDROID_IMAGE_30: registry.videolan.org/vlc-debian-android-3.0:20260610055743
+  VLC_ANDROID_IMAGE_40: registry.videolan.org/vlc-debian-android:20260610055743
+
+jobs:
+  validate-android-auto:
+    name: Validate Android Auto metadata
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify Android Auto manifest and resources
+        run: |
+          set -e
+          MANIFEST="application/vlc-android/AndroidManifest.xml"
+          DESCRIPTOR="application/vlc-android/res/xml/automotive_app_desc.xml"
+
+          echo "Checking for Android Auto descriptor: $DESCRIPTOR"
+          test -f "$DESCRIPTOR"
+
+          echo "Checking for Android Auto metadata in $MANIFEST"
+          grep -q "com.google.android.gms.car.application" "$MANIFEST"
+          grep -q "@xml/automotive_app_desc" "$MANIFEST"
+          grep -q "androidx.car.app.minCarApiLevel" "$MANIFEST"
+
+          echo "Android Auto metadata and resources are present."
+
+  select-image:
+    name: Select build image
+    needs: validate-android-auto
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.pick.outputs.image }}
+    steps:
+      - name: Pick Docker image for the requested VLC version
+        id: pick
+        run: |
+          if [ "${{ github.event.inputs.vlc_version || '3' }}" = "4" ]; then
+            echo "image=$VLC_ANDROID_IMAGE_40" >> "$GITHUB_OUTPUT"
+          else
+            echo "image=$VLC_ANDROID_IMAGE_30" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build APK (VLC ${{ github.event.inputs.vlc_version || '3' }}, ${{ github.event.inputs.build_variant || 'Debug' }})
+    needs: select-image
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.select-image.outputs.image }}
+    steps:
+      - name: Record workspace owner
+        id: owner
+        run: echo "uid_gid=$(stat -c '%u:%g' "$GITHUB_WORKSPACE")" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Gradle and bootstrap outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            .gradle/
+            gradle/
+            gradle-*/
+            gradlew
+          key: ${{ runner.os }}-gradle-vlc${{ github.event.inputs.vlc_version || '3' }}-${{ hashFiles('**/*.gradle*', 'buildsystem/compile.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-vlc${{ github.event.inputs.vlc_version || '3' }}-
+
+      - name: Build Debug APK
+        if: ${{ (github.event.inputs.build_variant || 'Debug') == 'Debug' }}
+        run: |
+          set -ex
+          if [ "${{ github.event.inputs.vlc_version || '3' }}" = "4" ]; then
+            ./buildsystem/compile.sh --init -vlc4
+            ./gradlew assembleDebug -PforceVlc4=true
+          else
+            ./buildsystem/compile.sh --init
+            ./gradlew assembleDebug
+          fi
+
+      - name: Build Release APK/AAB
+        if: ${{ (github.event.inputs.build_variant || 'Debug') == 'Release' }}
+        run: |
+          set -ex
+          if [ "${{ github.event.inputs.vlc_version || '3' }}" = "4" ]; then
+            ./buildsystem/compile.sh --init -vlc4
+          else
+            ./buildsystem/compile.sh --init
+          fi
+          ./gradlew assembleRelease bundleVlcBundle bundleVlcBundleAmazon
+
+      - name: Restore workspace ownership
+        if: always()
+        run: chown -R ${{ steps.owner.outputs.uid_gid }} "$GITHUB_WORKSPACE"
+
+      - name: Upload APK artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vlc-android-apk-vlc${{ github.event.inputs.vlc_version || '3' }}-${{ github.event.inputs.build_variant || 'Debug' }}
+          path: application/app/build/outputs/apk/**/*.apk
+          if-no-files-found: warn
+
+      - name: Upload AAB artifact
+        if: ${{ (github.event.inputs.build_variant || 'Debug') == 'Release' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vlc-android-aab-vlc${{ github.event.inputs.vlc_version || '3' }}
+          path: application/app/build/outputs/bundle/**/*.aab
+          if-no-files-found: warn
