@@ -1,0 +1,146 @@
+name: Build VLC Android Debug APK
+
+# Builds the VLC for Android debug APK from source using the same VideoLAN
+# Docker image and app-only build steps as the project's GitLab CI.
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # GitLab CI docker image, see buildsystem/gitlab/.gitlab-ci.yml
+  VLC_ANDROID_IMAGE_30: registry.videolan.org/vlc-debian-android-3.0:20260610055743
+  APK_ARTIFACT_NAME: vlc-android-debug-apk
+
+jobs:
+  validate-android-auto:
+    name: Validate Android Auto metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify Android Auto manifest and resources
+        run: |
+          set -e
+          MANIFEST="application/vlc-android/AndroidManifest.xml"
+          DESCRIPTOR="application/vlc-android/res/xml/automotive_app_desc.xml"
+
+          echo "Checking for Android Auto descriptor: $DESCRIPTOR"
+          test -f "$DESCRIPTOR"
+
+          echo "Checking for Android Auto metadata in $MANIFEST"
+          grep -q "com.google.android.gms.car.application" "$MANIFEST"
+          grep -q "@xml/automotive_app_desc" "$MANIFEST"
+          grep -q "androidx.car.app.minCarApiLevel" "$MANIFEST"
+
+          echo "Android Auto metadata and resources are present."
+
+  build-debug-apk:
+    name: Build VLC 3 debug APK
+    needs: validate-android-auto
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container:
+      image: registry.videolan.org/vlc-debian-android-3.0:20260610055743
+      options: --user 0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show build environment
+        run: |
+          set -x
+          whoami
+          id
+          pwd
+          df -h .
+          git --version
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global user.email "vlc-ci@videolan.org"
+          git config --global user.name "VLC CI"
+          echo "ANDROID_SDK=${ANDROID_SDK:-}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-}"
+          echo "ANDROID_NDK=${ANDROID_NDK:-}"
+          echo "JAVA_HOME=${JAVA_HOME:-}"
+          java -version
+
+      - name: Cache Gradle and bootstrap outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            .gradle/
+            gradle/
+            gradle-*/
+            gradlew
+          key: ${{ runner.os }}-gradle-vlc3-${{ hashFiles('**/*.gradle*', 'buildsystem/compile.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-vlc3-
+
+      - name: Initialize VLC Android build
+        run: |
+          set -eux
+          ./buildsystem/compile.sh --init
+
+      - name: Build debug APK
+        run: |
+          set -eux
+          ./gradlew assembleDebug
+
+      - name: Validate APK output
+        run: |
+          set -eux
+          find application/app/build/outputs/apk -type f -name '*.apk' -print -exec ls -lh {} \;
+          APK_COUNT="$(find application/app/build/outputs/apk -type f -name '*.apk' | wc -l)"
+          test "$APK_COUNT" -gt 0
+
+      - name: Upload debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APK_ARTIFACT_NAME }}
+          path: application/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+
+  emulator-install-smoke-test:
+    name: Emulator install smoke test
+    needs: build-debug-apk
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - name: Download debug APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.APK_ARTIFACT_NAME }}
+          path: apk-artifact
+
+      - name: Locate APK
+        run: |
+          set -eux
+          APK_PATH="$(find apk-artifact -type f -name '*.apk' | head -n 1)"
+          test -n "$APK_PATH"
+          echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
+          ls -lh "$APK_PATH"
+
+      - name: Install APK on emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7_pro
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: |
+            set -eux
+            adb install -r "$APK_PATH"
+            adb shell pm list packages | grep 'org.videolan.vlc.debug'
+            adb shell monkey -p org.videolan.vlc.debug -c android.intent.category.LAUNCHER 1
