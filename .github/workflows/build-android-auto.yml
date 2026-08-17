@@ -65,6 +65,8 @@ jobs:
           df -h .
           git --version
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global user.email "vlc-ci@videolan.org"
+          git config --global user.name "VLC CI"
           echo "ANDROID_SDK=${ANDROID_SDK:-}"
           echo "ANDROID_HOME=${ANDROID_HOME:-}"
           echo "ANDROID_NDK=${ANDROID_NDK:-}"
